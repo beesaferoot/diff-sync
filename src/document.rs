@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Represents the content of a document
+/// Versioned document content used as the unit of synchronization.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Document {
     pub content: String,
@@ -17,10 +17,7 @@ impl Document {
     }
 
     pub fn new_with_version(content: String, version: u64) -> Self {
-        Self {
-            content,
-            version,
-        }
+        Self { content, version }
     }
 
     pub fn update(&mut self, new_content: String) {

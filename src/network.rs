@@ -1,81 +1,93 @@
-use crate::{EditList, SyncEngine, Document, DocumentDB};
+use crate::{Document, DocumentDB, EditList, SyncEngine};
 use colored::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-/// Messages sent between client and server
+/// Cursor position and display color for a connected client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorInfo {
+    pub client_id: String,
+    pub position: usize,
+    pub color: String,
+}
+
+/// Wire protocol between client and server, serialized as externally-tagged JSON
+/// (serde default).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncMessage {
-    /// Client wants to connect and fetch current document
     Connect {
         client_id: String,
     },
-    /// Client sends edits to server
+
     ClientSync {
         client_id: String,
         edits: EditList,
         client_version: u64,
+        #[serde(default)]
+        cursor_position: Option<usize>,
     },
-    /// Server sends edits back to client
+
     ServerSync {
         edits: EditList,
         server_version: u64,
+        #[serde(default)]
+        cursors: Vec<CursorInfo>,
     },
-    /// Server confirms connection and provides current document state
+
     ConnectOk {
         server_version: u64,
         document: Document,
     },
-    /// Error occurred
+
     Error {
         message: String,
     },
-    /// Client disconnecting
     Disconnect {
         client_id: String,
     },
-    /// Heartbeat to keep connection alive
     Ping,
     Pong,
 }
 
-/// Represents a connected client on the server
+/// Server-side state for a single connected client.
 #[derive(Debug)]
 pub struct ClientSession {
     pub client_id: String,
     pub sync_engine: SyncEngine,
-    pub last_seen: std::time::Instant,
+    pub last_seen: Instant,
+    pub cursor_position: Option<usize>,
+    pub color: String,
 }
 
 impl ClientSession {
-    pub fn new(client_id: String, initial_content: String) -> Self {
+    pub fn new(client_id: String, initial_content: String, color: String) -> Self {
         let mut engine = SyncEngine::new(initial_content);
         engine.node_id = client_id.clone();
-        
         Self {
             client_id,
             sync_engine: engine,
-            last_seen: std::time::Instant::now(),
+            last_seen: Instant::now(),
+            cursor_position: None,
+            color,
         }
     }
 }
 
-/// Server state managing multiple clients with persistent storage
+/// Authoritative server managing multiple clients against a persistent document.
+///
+/// Each client gets its own `SyncEngine` shadow so the server can compute
+/// per-client diffs containing only edits from *other* clients.
 pub struct SyncServer {
-    /// Database for persistent document storage
     pub db: DocumentDB,
-    /// Name of the document being edited (support for multiple docs later)
     pub document_name: String,
-    /// Connected clients
     pub clients: HashMap<String, ClientSession>,
-    /// Server version counter  
     pub version: u64,
 }
 
 impl SyncServer {
-    /// Create a new server with database persistence
     pub fn new_with_db(db: DocumentDB, document_name: String) -> Result<Self, String> {
         Ok(Self {
             db,
@@ -85,145 +97,239 @@ impl SyncServer {
         })
     }
 
-    /// Create a new server with in-memory database (for testing)
     pub fn new_in_memory(document_name: String) -> Result<Self, String> {
         let db = DocumentDB::new_in_memory()
-            .map_err(|e| format!("Failed to create in-memory database: {}", e))?;
+            .map_err(|e| format!("Failed to create in-memory database: {e}"))?;
         Self::new_with_db(db, document_name)
     }
 
-    /// Get the current document from database
     pub fn get_current_document(&self) -> Result<Document, String> {
-        self.db.load_document(&self.document_name)
-            .map_err(|e| format!("Database error: {}", e))?
+        self.db
+            .load_document(&self.document_name)
+            .map_err(|e| format!("Database error: {e}"))?
             .ok_or_else(|| format!("Document '{}' not found", self.document_name))
     }
 
-    /// Handle a client connection
     pub fn connect_client(&mut self, client_id: String) -> Result<Document, String> {
         if self.clients.contains_key(&client_id) {
-            return Err(format!("Client {} already connected", client_id));
+            return Err(format!("Client {client_id} already connected"));
         }
 
-        // Get current document from database
         let current_doc = self.get_current_document()?;
+        let color = random_cursor_color();
+        let session = ClientSession::new(client_id.clone(), current_doc.content.clone(), color);
 
-        // Create new client session with current document content from database
-        let session = ClientSession::new(client_id.clone(), current_doc.content.clone());
-        
         self.clients.insert(client_id.clone(), session);
         self.version += 1;
-        
-        println!("✅ Client {} connected (version {})", client_id.green(), self.version);
+
+        println!("Client {} connected (v{})", client_id.green(), self.version);
         Ok(current_doc)
     }
 
-    /// Handle client sync - client sends edits and receives database document updates
-    pub fn sync_with_client(&mut self, client_id: &str, client_edits: EditList) -> Result<EditList, String> {
-        // First check if client exists
+    /// Process a client sync: apply the client's edits to the DB, then diff
+    /// the client's shadow against the (possibly updated) DB document to
+    /// produce edits containing only changes from *other* clients.
+    pub fn sync_with_client(
+        &mut self,
+        client_id: &str,
+        client_edits: EditList,
+    ) -> Result<EditList, String> {
         if !self.clients.contains_key(client_id) {
-            return Err(format!("Client {} not found", client_id));
+            return Err(format!("Client {client_id} not found"));
         }
 
-        // Get current document from database before working with client session
         let mut current_doc = self.get_current_document()?;
 
-        // Apply client edits to current document and save to database
         if !client_edits.is_empty() {
-            // Apply edits to document content
             let new_content = crate::diff::patch(&current_doc.content, &client_edits)
-                .map_err(|e| format!("Failed to apply client edits: {}", e))?;
-            
-            // Update document in database
-            current_doc = self.db.update_document(&self.document_name, new_content)
-                .map_err(|e| format!("Failed to save document: {}", e))?;
-            
-            println!("📝 Client {} updated document (v{})", client_id.green(), current_doc.version);
+                .map_err(|e| format!("Failed to apply client edits: {e}"))?;
+
+            current_doc = self
+                .db
+                .update_document(&self.document_name, new_content)
+                .map_err(|e| format!("Failed to save document: {e}"))?;
+
+            println!(
+                "Client {} updated document (v{})",
+                client_id.green(),
+                current_doc.version
+            );
             self.version += 1;
         }
 
-        // Now get mutable access to client session for shadow operations
-        let client_session = self.clients.get_mut(client_id)
-            .ok_or_else(|| format!("Client {} not found", client_id))?;
+        let session = self
+            .clients
+            .get_mut(client_id)
+            .ok_or_else(|| format!("Client {client_id} not found"))?;
 
-        // Update client's last seen
-        client_session.last_seen = std::time::Instant::now();
+        session.last_seen = Instant::now();
 
-        // CRITICAL: Apply the SAME edits to client's shadow to keep them in sync
-        // This prevents sending the client's own edits back to them
+        // Keep the client's shadow in sync by applying the same edits
         if !client_edits.is_empty() {
-            if let Err(e) = client_session.sync_engine.apply_edits(client_edits.clone()) {
-                return Err(format!("Failed to apply client edits to shadow: {}", e));
-            }
+            session
+                .sync_engine
+                .apply_edits(client_edits)
+                .map_err(|e| format!("Failed to apply client edits to shadow: {e}"))?;
         }
 
-        // Generate diff from client's current shadow to current database document
-        // This will only contain changes from OTHER clients
-        let server_edits = crate::diff::diff(
-            &client_session.sync_engine.text(),
-            &current_doc.content
-        );
+        // Diff shadow against DB document — only other clients' changes remain
+        let server_edits = crate::diff::diff(session.sync_engine.text(), &current_doc.content);
 
-        // Update client's shadow to match current document
         if !server_edits.is_empty() {
-            client_session.sync_engine.edit(&current_doc.content);
-            println!("📤 Sending {} edits to client {} (changes from other clients)",
-                    server_edits.len().to_string().cyan(), client_id.green());
+            session.sync_engine.edit(&current_doc.content);
+            println!(
+                "Sending {} edits to client {}",
+                server_edits.len().to_string().cyan(),
+                client_id.green()
+            );
         }
 
         Ok(server_edits)
     }
 
-    /// Disconnect a client
-    pub fn disconnect_client(&mut self, client_id: &str) {
-        if self.clients.remove(client_id).is_some() {
-            println!("👋 Client {} disconnected", client_id);
+    pub fn update_cursor(&mut self, client_id: &str, position: usize) {
+        if let Some(session) = self.clients.get_mut(client_id) {
+            session.cursor_position = Some(position);
         }
     }
 
-    /// Get current document content from database
-    pub fn get_document_content(&self) -> Result<String, String> {
-        let doc = self.get_current_document()?;
-        Ok(doc.content)
+    /// Return cursor info for every client except `exclude_client`.
+    pub fn get_cursors_for(&self, exclude_client: &str) -> Vec<CursorInfo> {
+        self.clients
+            .values()
+            .filter_map(|s| {
+                if s.client_id == exclude_client {
+                    return None;
+                }
+                Some(CursorInfo {
+                    client_id: s.client_id.clone(),
+                    position: s.cursor_position?,
+                    color: s.color.clone(),
+                })
+            })
+            .collect()
     }
 
-    /// Get list of connected clients
+    pub fn disconnect_client(&mut self, client_id: &str) {
+        if self.clients.remove(client_id).is_some() {
+            println!("Client {} disconnected", client_id);
+        }
+    }
+
+    pub fn get_document_content(&self) -> Result<String, String> {
+        Ok(self.get_current_document()?.content)
+    }
+
     pub fn get_connected_clients(&self) -> Vec<&str> {
         self.clients.keys().map(|s| s.as_str()).collect()
     }
 
-    /// Remove clients that haven't been seen for a while
     pub fn cleanup_stale_clients(&mut self, timeout_secs: u64) {
-        let now = std::time::Instant::now();
-        let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-        
-        let stale_clients: Vec<String> = self.clients
+        let timeout = Duration::from_secs(timeout_secs);
+        let now = Instant::now();
+
+        let stale: Vec<String> = self
+            .clients
             .iter()
-            .filter(|(_, session)| now.duration_since(session.last_seen) > timeout_duration)
+            .filter(|(_, s)| now.duration_since(s.last_seen) > timeout)
             .map(|(id, _)| id.clone())
             .collect();
 
-        for client_id in stale_clients {
-            self.disconnect_client(&client_id);
+        for id in stale {
+            self.disconnect_client(&id);
         }
     }
 }
 
-/// Shared server state for async handling
+/// Thread-safe handle to the server, shared across async tasks and connections.
 pub type SharedSyncServer = Arc<Mutex<SyncServer>>;
 
-/// Serialize a message to JSON bytes
+/// Serialize a `SyncMessage` to newline-delimited JSON bytes (for TCP framing).
 pub fn serialize_message(msg: &SyncMessage) -> Result<Vec<u8>, serde_json::Error> {
-    let json = serde_json::to_string(msg)?;
-    Ok(format!("{}\n", json).into_bytes())
+    let mut json = serde_json::to_string(msg)?;
+    json.push('\n');
+    Ok(json.into_bytes())
 }
 
-/// Deserialize a message from JSON
+/// Deserialize a `SyncMessage` from JSON bytes.
 pub fn deserialize_message(data: &[u8]) -> Result<SyncMessage, String> {
-    let json_str = std::str::from_utf8(data)
-        .map_err(|e| e.to_string())?
-        .trim();
-    let message = serde_json::from_str(json_str)
-        .map_err(|e| e.to_string())?;
-    Ok(message)
+    let json_str = std::str::from_utf8(data).map_err(|e| e.to_string())?.trim();
+    serde_json::from_str(json_str).map_err(|e| e.to_string())
+}
+
+/// Route an incoming message to the appropriate server handler and return the
+/// response (if any). Shared by both TCP and WebSocket transports.
+pub async fn handle_sync_message(
+    message: SyncMessage,
+    server: &SharedSyncServer,
+    client_id: &mut Option<String>,
+) -> Option<SyncMessage> {
+    match message {
+        SyncMessage::Connect { client_id: id } => {
+            println!("Client {} requesting connection", id.green());
+            let mut server_lock = server.lock().await;
+            match server_lock.connect_client(id.clone()) {
+                Ok(document) => {
+                    *client_id = Some(id);
+                    Some(SyncMessage::ConnectOk {
+                        server_version: server_lock.version,
+                        document,
+                    })
+                }
+                Err(e) => Some(SyncMessage::Error { message: e }),
+            }
+        }
+
+        SyncMessage::ClientSync {
+            client_id: id,
+            edits,
+            cursor_position,
+            ..
+        } => {
+            let mut server_lock = server.lock().await;
+
+            if let Some(pos) = cursor_position {
+                server_lock.update_cursor(&id, pos);
+            }
+
+            if !edits.is_empty() {
+                println!(
+                    "Client {} syncing {} edits",
+                    id.cyan(),
+                    edits.len().to_string().yellow()
+                );
+            }
+
+            match server_lock.sync_with_client(&id, edits) {
+                Ok(server_edits) => {
+                    let cursors = server_lock.get_cursors_for(&id);
+                    Some(SyncMessage::ServerSync {
+                        edits: server_edits,
+                        server_version: server_lock.version,
+                        cursors,
+                    })
+                }
+                Err(e) => Some(SyncMessage::Error { message: e }),
+            }
+        }
+
+        SyncMessage::Disconnect { client_id: id } => {
+            server.lock().await.disconnect_client(&id);
+            None
+        }
+
+        SyncMessage::Ping => Some(SyncMessage::Pong),
+
+        _ => Some(SyncMessage::Error {
+            message: "Unexpected message type".to_string(),
+        }),
+    }
+}
+
+/// Generate a random saturated HSL color for cursor display.
+fn random_cursor_color() -> String {
+    let hue = rand::random::<u16>() % 360;
+    let sat = 60 + (rand::random::<u8>() % 30);
+    let lit = 45 + (rand::random::<u8>() % 15);
+    format!("hsl({hue}, {sat}%, {lit}%)")
 }

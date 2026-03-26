@@ -1,2 +1,13 @@
 target/
 *.db
+
+# Next.js
+web/node_modules/
+web/.next/
+
+# E2E tests
+test/node_modules/
+test/test-results/
+test/playwright-report/
+test_documents.db
+.claude

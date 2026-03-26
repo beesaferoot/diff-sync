@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use colored::*;
-use diff_sync::{SyncEngine, SyncResult};
+use diff_sync::{truncate_text, SyncEngine, SyncResult};
 use std::io::{self, Write};
 
 #[derive(Parser)]
@@ -13,17 +13,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Interactive demo with two users editing simultaneously
+    /// Two-user editing simulation with manual sync
     Interactive {
-        #[arg(short, long, default_value = "The quick brown fox jumps over the lazy dog")]
+        #[arg(
+            short,
+            long,
+            default_value = "The quick brown fox jumps over the lazy dog"
+        )]
         initial_text: String,
     },
-    /// Simulation of concurrent edits
+    /// Automated concurrent edit simulation
     Simulate {
         #[arg(short, long, default_value = "10")]
         iterations: usize,
     },
-    /// Benchmark synchronization performance
+    /// Throughput benchmark
     Benchmark {
         #[arg(short, long, default_value = "1000")]
         iterations: usize,
@@ -32,19 +36,20 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
-
     match cli.command {
-        Commands::Interactive { initial_text } => run_interactive_demo(initial_text),
+        Commands::Interactive { initial_text } => run_interactive(initial_text),
         Commands::Simulate { iterations } => run_simulation(iterations),
         Commands::Benchmark { iterations } => run_benchmark(iterations),
     }
 }
 
-fn run_interactive_demo(initial_text: String) {
-    println!("{}", "=== Differential Synchronization Demo ===".bold().cyan());
-    println!("This demo simulates two users editing the same document.");
-    println!("You can edit both 'Alice' and 'Bob' documents and see them sync.");
-    println!("Commands: 'a <text>' (edit Alice), 'b <text>' (edit Bob), 's' (sync), 'q' (quit)\n");
+fn run_interactive(initial_text: String) {
+    println!(
+        "{}",
+        "=== Differential Synchronization Demo ===".bold().cyan()
+    );
+    println!("Simulates two users editing the same document.");
+    println!("Commands: 'a <text>' (Alice), 'b <text>' (Bob), 's' (sync), 'q' (quit)\n");
 
     let mut alice = SyncEngine::new(initial_text.clone());
     let mut bob = SyncEngine::new(initial_text);
@@ -65,59 +70,49 @@ fn run_interactive_demo(initial_text: String) {
             continue;
         }
 
-        match input.chars().next() {
-            Some('q') => {
+        match input.as_bytes()[0] {
+            b'q' => {
                 println!("Goodbye!");
                 break;
             }
-            Some('s') => {
+            b's' => {
                 println!("{}", "=== Synchronizing ===".yellow());
-                let (alice_result, bob_result) = alice.sync_with(&mut bob);
-                print_sync_results(&alice_result, &bob_result);
+                let (server_result, client_result) = alice.sync_with(&mut bob);
+                print_sync_results(&server_result, &client_result);
                 print_state(&alice, &bob);
             }
-            Some('a') => {
-                let text = input[1..].trim();
-                if !text.is_empty() {
-                    alice.edit(text);
-                    println!("{} Alice edited document", "✏️".green());
-                    print_state(&alice, &bob);
-                }
+            b'a' if input.len() > 2 => {
+                alice.edit(&input[2..]);
+                println!("Alice edited document");
+                print_state(&alice, &bob);
             }
-            Some('b') => {
-                let text = input[1..].trim();
-                if !text.is_empty() {
-                    bob.edit(text);
-                    println!("{} Bob edited document", "✏️".green());
-                    print_state(&alice, &bob);
-                }
+            b'b' if input.len() > 2 => {
+                bob.edit(&input[2..]);
+                println!("Bob edited document");
+                print_state(&alice, &bob);
             }
-            Some('h') | Some('?') => {
-                print_help();
-            }
-            _ => {
-                println!("Unknown command. Type 'h' for help.");
-            }
+            b'h' | b'?' => print_help(),
+            _ => println!("Unknown command. Type 'h' for help."),
         }
     }
 }
 
 fn run_simulation(iterations: usize) {
     println!("{}", "=== Concurrent Edit Simulation ===".bold().cyan());
-    
+
     let mut alice = SyncEngine::new("The cat sat on the mat.".to_string());
     let mut bob = SyncEngine::new("The cat sat on the mat.".to_string());
     alice.node_id = "Alice".to_string();
     bob.node_id = "Bob".to_string();
 
-    let alice_edits = vec![
+    let alice_edits = [
         "The big cat sat on the mat.",
         "The big black cat sat on the mat.",
         "The big black cat sat on the soft mat.",
         "The big black cat sat comfortably on the soft mat.",
     ];
 
-    let bob_edits = vec![
+    let bob_edits = [
         "The cat sat on the red mat.",
         "The cat sat peacefully on the red mat.",
         "The cat sat peacefully on the red woolen mat.",
@@ -127,109 +122,99 @@ fn run_simulation(iterations: usize) {
     println!("Initial state:");
     print_state(&alice, &bob);
 
-    for i in 0..iterations.min(alice_edits.len()).min(bob_edits.len()) {
+    let rounds = iterations.min(alice_edits.len()).min(bob_edits.len());
+    for i in 0..rounds {
         println!("\n{}", format!("=== Iteration {} ===", i + 1).yellow());
-        
-        // Both users make edits
+
         alice.edit(alice_edits[i]);
         bob.edit(bob_edits[i]);
-        
+
         println!("After concurrent edits:");
         print_state(&alice, &bob);
-        
-        // Synchronize
-        let (alice_result, bob_result) = alice.sync_with(&mut bob);
-        
+
+        let (server_result, client_result) = alice.sync_with(&mut bob);
+
         println!("\nAfter synchronization:");
-        print_sync_results(&alice_result, &bob_result);
+        print_sync_results(&server_result, &client_result);
         print_state(&alice, &bob);
-        
-        // Verify they're in sync
+
         if alice.text() == bob.text() {
-            println!("{} Documents are synchronized!", "✅".green());
+            println!("{}", "Documents are synchronized!".green());
         } else {
-            println!("{} Documents are out of sync!", "❌".red());
+            println!("{}", "Documents are out of sync!".red());
         }
     }
 }
 
 fn run_benchmark(iterations: usize) {
     println!("{}", "=== Synchronization Benchmark ===".bold().cyan());
-    
+
     let start = std::time::Instant::now();
-    let mut successful_syncs = 0;
-    let mut total_edits = 0;
+    let mut successful_syncs = 0u64;
+    let mut total_edits = 0u64;
 
     for i in 0..iterations {
-        let mut alice = SyncEngine::new(format!("Document {} content", i));
-        let mut bob = SyncEngine::new(format!("Document {} content", i));
-        
-        // Make some edits
-        alice.edit(&format!("Alice modified document {} with some changes", i));
-        bob.edit(&format!("Bob also modified document {} differently", i));
-        
-        // Sync
-        let (alice_result, bob_result) = alice.sync_with(&mut bob);
-        
-        if alice_result.success && bob_result.success {
+        let mut alice = SyncEngine::new(format!("Document {i} content"));
+        let mut bob = SyncEngine::new(format!("Document {i} content"));
+
+        alice.edit(&format!("Alice modified document {i} with some changes"));
+        bob.edit(&format!("Bob also modified document {i} differently"));
+
+        let (a, b) = alice.sync_with(&mut bob);
+        if a.success && b.success {
             successful_syncs += 1;
         }
-        
-        total_edits += alice_result.edits.len() + bob_result.edits.len();
+        total_edits += (a.edits.len() + b.edits.len()) as u64;
     }
 
     let duration = start.elapsed();
-    
-    println!("Completed {} synchronization cycles in {:?}", iterations, duration);
-    println!("Successful syncs: {} ({:.1}%)", successful_syncs, 
-             (successful_syncs as f64 / iterations as f64) * 100.0);
-    println!("Total edits processed: {}", total_edits);
-    println!("Average time per sync: {:?}", duration / iterations as u32);
-    println!("Syncs per second: {:.1}", iterations as f64 / duration.as_secs_f64());
+    let pct = (successful_syncs as f64 / iterations as f64) * 100.0;
+
+    println!("Completed {iterations} sync cycles in {duration:?}");
+    println!("Successful: {successful_syncs} ({pct:.1}%)");
+    println!("Total edits: {total_edits}");
+    println!("Avg per sync: {:?}", duration / iterations as u32);
+    println!(
+        "Syncs/sec: {:.1}",
+        iterations as f64 / duration.as_secs_f64()
+    );
 }
 
 fn print_state(alice: &SyncEngine, bob: &SyncEngine) {
     println!("\n{}", "Current State:".bold());
-    println!("  {}: \"{}\"", 
-             "Alice".blue().bold(), 
-             truncate_text(alice.text(), 60));
-    println!("  {}:   \"{}\"", 
-             "Bob".green().bold(), 
-             truncate_text(bob.text(), 60));
-    
+    println!(
+        "  {}: \"{}\"",
+        "Alice".blue().bold(),
+        truncate_text(alice.text(), 60)
+    );
+    println!(
+        "  {}:   \"{}\"",
+        "Bob".green().bold(),
+        truncate_text(bob.text(), 60)
+    );
+
     if alice.text() == bob.text() {
-        println!("  {}", "✅ Documents are in sync".green());
+        println!("  {}", "Documents are in sync".green());
     } else {
-        println!("  {}", "❌ Documents differ".red());
+        println!("  {}", "Documents differ".red());
     }
 }
 
-fn print_sync_results(alice_result: &SyncResult, bob_result: &SyncResult) {
-    if !alice_result.edits.is_empty() {
-        println!("  Alice -> Bob: {}", format_edit_summary(&alice_result.edits));
+fn print_sync_results(server_result: &SyncResult, client_result: &SyncResult) {
+    if !server_result.edits.is_empty() {
+        println!(
+            "  Alice -> Bob: {} edits",
+            server_result.edits.len().to_string().cyan()
+        );
     }
-    if !bob_result.edits.is_empty() {
-        println!("  Bob -> Alice: {}", format_edit_summary(&bob_result.edits));
+    if !client_result.edits.is_empty() {
+        println!(
+            "  Bob -> Alice: {} edits",
+            client_result.edits.len().to_string().cyan()
+        );
     }
-    
-    if alice_result.edits.is_empty() && bob_result.edits.is_empty() {
+    if server_result.edits.is_empty() && client_result.edits.is_empty() {
         println!("  {}", "No changes to sync".dimmed());
-    }
-}
-
-fn format_edit_summary(edits: &diff_sync::EditList) -> String {
-    if edits.is_empty() {
-        "no changes".dimmed().to_string()
-    } else {
-        format!("{} edits", edits.len()).cyan().to_string()
-    }
-}
-
-fn truncate_text(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
-        text.to_string()
-    } else {
-        format!("{}...", &text[..max_len.saturating_sub(3)])
     }
 }
 
