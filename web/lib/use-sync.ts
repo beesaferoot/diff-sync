@@ -11,6 +11,7 @@ const RECONNECT_MAX_MS = 10000;
 interface UseSyncOptions {
   serverUrl: string;
   clientId?: string;
+  sessionToken?: string;
 }
 
 interface UseSyncResult {
@@ -30,6 +31,7 @@ function generateClientId(): string {
 export function useSync({
   serverUrl,
   clientId: providedId,
+  sessionToken,
 }: UseSyncOptions): UseSyncResult {
   const [clientId] = useState(() => providedId ?? generateClientId());
   const [document, setDocumentState] = useState("");
@@ -89,7 +91,8 @@ export function useSync({
   const connect = useCallback(() => {
     if (!mountedRef.current) return;
 
-    const ws = new WebSocket(serverUrl);
+    const url = sessionToken ? `${serverUrl}?session=${encodeURIComponent(sessionToken)}` : serverUrl;
+    const ws = new WebSocket(url);
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -146,7 +149,7 @@ export function useSync({
     ws.onerror = (err) => {
       console.error("WebSocket error:", err);
     };
-  }, [serverUrl, clientId, startSyncInterval, stopSyncInterval]);
+  }, [serverUrl, clientId, sessionToken, startSyncInterval, stopSyncInterval]);
 
   useEffect(() => {
     mountedRef.current = true;

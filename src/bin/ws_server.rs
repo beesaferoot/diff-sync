@@ -1,15 +1,18 @@
 use axum::{
     extract::ws::{Message, WebSocket},
-    extract::{State, WebSocketUpgrade},
+    extract::{Path, Query, State, WebSocketUpgrade},
+    http::StatusCode,
     response::IntoResponse,
-    routing::get,
-    Router,
+    routing::{get, post},
+    Json, Router,
 };
 use clap::Parser;
 use colored::*;
 use diff_sync::{
-    handle_sync_message, truncate_text, DocumentDB, SharedSyncServer, SyncMessage, SyncServer,
+    handle_sync_message, DocumentDB, SessionError, SessionManager,
+    SharedSessionManager, SharedSyncServer, SyncMessage,
 };
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -22,19 +25,15 @@ use tower_http::services::{ServeDir, ServeFile};
 #[command(name = "ws-server")]
 #[command(about = "Differential synchronization server with TCP + WebSocket support")]
 struct Cli {
-    #[arg(long, default_value = "0.0.0.0:8080")]
+    #[arg(long, default_value = "127.0.0.1:8080")]
     tcp_address: String,
 
-    #[arg(long, default_value = "0.0.0.0:8081")]
+    #[arg(long, default_value = "127.0.0.1:8081")]
     ws_address: String,
 
     #[arg(short, long, default_value = "documents.db")]
     database_path: String,
 
-    #[arg(short, long, default_value = "main")]
-    document_name: String,
-
-    /// Path to the Next.js static export directory
     #[arg(long, default_value = "web/out")]
     static_dir: String,
 }
@@ -51,39 +50,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("WS:  {}", cli.ws_address.cyan());
     println!("DB:  {}", cli.database_path.cyan());
 
-    let db = DocumentDB::new(&cli.database_path)
-        .map_err(|e| format!("Failed to create database: {e}"))?;
+    DocumentDB::new(&cli.database_path)
+        .map_err(|e| format!("Failed to initialize database: {e}"))?;
 
-    let server: SharedSyncServer = Arc::new(Mutex::new(
-        SyncServer::new_with_db(db, cli.document_name)
-            .map_err(|e| format!("Failed to create server: {e}"))?,
-    ));
+    let manager: SharedSessionManager = Arc::new(Mutex::new(SessionManager::new(
+        cli.database_path.clone(),
+    )));
 
-    {
-        let lock = server.lock().await;
-        let doc = lock
-            .get_current_document()
-            .map_err(|e| format!("Failed to load document: {e}"))?;
-        println!("Initial content: \"{}\"", doc.content.blue());
-    }
+    spawn_cleanup_task(Arc::clone(&manager));
 
-    spawn_cleanup_task(Arc::clone(&server));
-    spawn_status_task(Arc::clone(&server));
-
-    // TCP listener in background
-    let tcp_server = Arc::clone(&server);
+    let tcp_manager = Arc::clone(&manager);
     let tcp_addr = cli.tcp_address.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_tcp_listener(tcp_server, &tcp_addr).await {
+        if let Err(e) = run_tcp_listener(tcp_manager, &tcp_addr).await {
             eprintln!("TCP listener error: {e}");
         }
     });
 
-    // WebSocket + static file server (foreground with graceful shutdown)
     let index = ServeFile::new(format!("{}/index.html", &cli.static_dir));
     let app = Router::new()
         .route("/ws", get(ws_handler))
-        .with_state(Arc::clone(&server))
+        .route("/api/sessions", post(create_session_handler))
+        .route("/api/sessions/:token", get(get_session_handler))
+        .route("/api/sessions/:token/close", post(close_session_handler))
+        .route("/health", get(|| async { "ok" }))
+        .with_state(Arc::clone(&manager))
         .fallback_service(ServeDir::new(&cli.static_dir).not_found_service(index))
         .layer(CorsLayer::permissive());
 
@@ -99,33 +90,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn spawn_cleanup_task(server: SharedSyncServer) {
+fn spawn_cleanup_task(manager: SharedSessionManager) {
     tokio::spawn(async move {
         let mut timer = interval(Duration::from_secs(30));
         loop {
             timer.tick().await;
-            server.lock().await.cleanup_stale_clients(120);
-        }
-    });
-}
-
-fn spawn_status_task(server: SharedSyncServer) {
-    tokio::spawn(async move {
-        let mut timer = interval(Duration::from_secs(10));
-        loop {
-            timer.tick().await;
-            let lock = server.lock().await;
-            let clients = lock.get_connected_clients();
-            if !clients.is_empty() {
-                let content = lock
-                    .get_document_content()
-                    .unwrap_or_else(|_| "Error loading document".to_string());
-                println!(
-                    "Active clients: {} | Document: \"{}\"",
-                    clients.len().to_string().cyan(),
-                    truncate_text(&content, 40).dimmed()
-                );
-            }
+            let mut mgr = manager.lock().await;
+            mgr.cleanup_stale_clients(120).await;
+            mgr.cleanup_idle_sessions(Duration::from_secs(300)).await;
         }
     });
 }
@@ -137,18 +109,178 @@ async fn shutdown_signal() {
     println!("\nShutdown signal received");
 }
 
-// WebSocket Connections
+#[derive(Deserialize)]
+struct CreateSessionRequest {
+    #[serde(default)]
+    initial_content: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CreateSessionResponse {
+    token: String,
+    creator_secret: String,
+    url: String,
+}
+
+async fn create_session_handler(
+    State(manager): State<SharedSessionManager>,
+    Json(body): Json<CreateSessionRequest>,
+) -> impl IntoResponse {
+    let content = body.initial_content.as_deref().unwrap_or("");
+    let mgr = manager.lock().await;
+    match mgr.create_session(content) {
+        Ok((token, creator_secret)) => {
+            let url = format!("/s/{token}");
+            println!("Session created: {}", token.green());
+            (
+                StatusCode::CREATED,
+                Json(CreateSessionResponse {
+                    token,
+                    creator_secret,
+                    url,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            eprintln!("Failed to create session: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SessionInfoResponse {
+    token: String,
+    status: String,
+    created_at: i64,
+    closed_at: Option<i64>,
+}
+
+async fn get_session_handler(
+    State(manager): State<SharedSessionManager>,
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    let mgr = manager.lock().await;
+    match mgr.get_session(&token) {
+        Ok(session) => (
+            StatusCode::OK,
+            Json(SessionInfoResponse {
+                token: session.token,
+                status: session.status,
+                created_at: session.created_at,
+                closed_at: session.closed_at,
+            }),
+        )
+            .into_response(),
+        Err(SessionError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CloseSessionRequest {
+    creator_secret: String,
+}
+
+#[derive(Serialize)]
+struct CloseSessionResponse {
+    ok: bool,
+}
+
+async fn close_session_handler(
+    State(manager): State<SharedSessionManager>,
+    Path(token): Path<String>,
+    Json(body): Json<CloseSessionRequest>,
+) -> impl IntoResponse {
+    let mut mgr = manager.lock().await;
+    match mgr.close_session(&token, &body.creator_secret).await {
+        Ok(()) => {
+            println!("Session closed: {}", token.yellow());
+            (StatusCode::OK, Json(CloseSessionResponse { ok: true })).into_response()
+        }
+        Err(SessionError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(SessionError::Closed) => {
+            (StatusCode::GONE, "Session already closed").into_response()
+        }
+        Err(SessionError::Forbidden) => {
+            (StatusCode::FORBIDDEN, "Invalid creator secret").into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct WsParams {
+    session: Option<String>,
+}
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    State(server): State<SharedSyncServer>,
+    Query(params): Query<WsParams>,
+    State(manager): State<SharedSessionManager>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_ws_client(socket, server))
+    let session_token = params.session;
+
+    if let Some(ref token) = session_token {
+        let mgr = manager.lock().await;
+        match mgr.get_session(token) {
+            Ok(session) if session.status == "active" => {}
+            Ok(_) => {
+                return (StatusCode::GONE, "Session has ended").into_response();
+            }
+            Err(SessionError::NotFound) => {
+                return (StatusCode::NOT_FOUND, "Session not found").into_response();
+            }
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        }
+    }
+
+    ws.on_upgrade(move |socket| handle_ws_client(socket, manager, session_token))
+        .into_response()
 }
 
-async fn handle_ws_client(mut socket: WebSocket, server: SharedSyncServer) {
+async fn handle_ws_client(
+    mut socket: WebSocket,
+    manager: SharedSessionManager,
+    session_token: Option<String>,
+) {
+    let server = {
+        let mut mgr = manager.lock().await;
+        if let Some(ref token) = session_token {
+            match mgr.get_or_start_session(token) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to start session: {e}");
+                    let err = SyncMessage::Error {
+                        message: e.to_string(),
+                    };
+                    if let Ok(json) = serde_json::to_string(&err) {
+                        let _ = socket.send(Message::Text(json.into())).await;
+                    }
+                    return;
+                }
+            }
+        } else {
+            match mgr.default_server() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to start default server: {e}");
+                    return;
+                }
+            }
+        }
+    };
+
+    let label = session_token
+        .as_deref()
+        .map(|t| format!("session {}", &t[..t.len().min(8)]))
+        .unwrap_or_else(|| "default".to_string());
+    println!("New WebSocket connection ({})", label.cyan());
+
     let mut client_id: Option<String> = None;
-    println!("New WebSocket connection");
 
     while let Some(Ok(msg)) = socket.recv().await {
         match msg {
@@ -156,7 +288,8 @@ async fn handle_ws_client(mut socket: WebSocket, server: SharedSyncServer) {
                 let parsed: Result<SyncMessage, _> = serde_json::from_str(&text);
                 match parsed {
                     Ok(message) => {
-                        let response = handle_sync_message(message, &server, &mut client_id).await;
+                        let response =
+                            handle_sync_message(message, &server, &mut client_id).await;
                         if let Some(resp) = response {
                             match serde_json::to_string(&resp) {
                                 Ok(json) => {
@@ -180,20 +313,18 @@ async fn handle_ws_client(mut socket: WebSocket, server: SharedSyncServer) {
                 }
             }
             Message::Close(_) => break,
-            _ => {} // axum handles ping/pong automatically
+            _ => {}
         }
     }
 
     if let Some(id) = &client_id {
-        println!("WebSocket client {} disconnected", id);
+        println!("WebSocket client {} disconnected ({})", id, label);
         server.lock().await.disconnect_client(id);
     }
 }
 
-//  TCP Connections
-
 async fn run_tcp_listener(
-    server: SharedSyncServer,
+    manager: SharedSessionManager,
     address: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(address).await?;
@@ -202,9 +333,19 @@ async fn run_tcp_listener(
         match listener.accept().await {
             Ok((stream, addr)) => {
                 println!("New TCP connection from {}", addr.to_string().yellow());
-                let server_clone = Arc::clone(&server);
+                let mgr = Arc::clone(&manager);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_tcp_client(stream, server_clone).await {
+                    let server = {
+                        let mut m = mgr.lock().await;
+                        match m.default_server() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("Failed to start default server: {e}");
+                                return;
+                            }
+                        }
+                    };
+                    if let Err(e) = handle_tcp_client(stream, server).await {
                         eprintln!("TCP client error: {}", e.to_string().red());
                     }
                 });

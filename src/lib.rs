@@ -5,6 +5,8 @@ pub mod sync;
 
 #[cfg(feature = "network")]
 pub mod network;
+#[cfg(feature = "network")]
+pub mod session;
 
 pub use diff::*;
 pub use document::*;
@@ -13,6 +15,8 @@ pub use sync::*;
 
 #[cfg(feature = "network")]
 pub use network::*;
+#[cfg(feature = "network")]
+pub use session::*;
 
 /// Truncate text to `max_len` characters, appending "..." if truncated.
 /// Operates on char boundaries to avoid splitting multi-byte UTF-8 sequences.
