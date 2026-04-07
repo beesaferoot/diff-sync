@@ -3,8 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { SyncEngine } from "./sync-engine";
 import type { SyncMessage, CursorInfo } from "./protocol";
+import type { EditList } from "./diff";
 
-const SYNC_INTERVAL_MS = 500;
+const SYNC_INTERVAL_MS = 200;
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 10000;
 
@@ -12,6 +13,7 @@ interface UseSyncOptions {
   serverUrl: string;
   clientId?: string;
   sessionToken?: string;
+  onRemoteEdits?: (edits: EditList) => void;
 }
 
 interface UseSyncResult {
@@ -32,6 +34,7 @@ export function useSync({
   serverUrl,
   clientId: providedId,
   sessionToken,
+  onRemoteEdits,
 }: UseSyncOptions): UseSyncResult {
   const [clientId] = useState(() => providedId ?? generateClientId());
   const [document, setDocumentState] = useState("");
@@ -48,6 +51,8 @@ export function useSync({
   const reconnectDelayRef = useRef(RECONNECT_BASE_MS);
   const mountedRef = useRef(true);
   const cursorPositionRef = useRef<number | null>(null);
+  const onRemoteEditsRef = useRef(onRemoteEdits);
+  onRemoteEditsRef.current = onRemoteEdits;
 
   const setDocument = useCallback((content: string) => {
     if (engineRef.current) {
@@ -125,6 +130,9 @@ export function useSync({
           setRemoteCursors(cursors);
           if (edits.edits.length > 0 && engineRef.current) {
             engineRef.current.applyEdits(edits);
+            if (onRemoteEditsRef.current) {
+              onRemoteEditsRef.current(edits);
+            }
             setDocumentState(engineRef.current.text());
           }
         } else if ("Error" in msg) {

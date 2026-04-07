@@ -9,6 +9,14 @@
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+/** Convert a UTF-8 byte offset to a JS string character index. */
+export function byteToCharOffset(text: string, byteOffset: number): number {
+  const bytes = encoder.encode(text);
+  const clampedOffset = Math.min(byteOffset, bytes.length);
+  const prefix = decoder.decode(bytes.slice(0, clampedOffset));
+  return prefix.length;
+}
+
 export type Edit =
   | { Insert: { pos: number; text: string } }
   | { Delete: { pos: number; len: number } }

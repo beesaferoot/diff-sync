@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { EditorView } from "../lib/editor-view";
+import { EditorView } from "../../lib/editor-view";
 
 function copyToClipboard(text: string) {
   if (navigator.clipboard?.writeText) {
@@ -41,7 +41,7 @@ function getTokenFromPath(): string | null {
   return match ? match[1] : null;
 }
 
-export default function Page() {
+export function Page() {
   const [view, setView] = useState<ViewState>({ type: "landing" });
   const [secretCopied, setSecretCopied] = useState(false);
   const [creatorInfo, setCreatorInfo] = useState<{

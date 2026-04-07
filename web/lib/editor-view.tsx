@@ -1,8 +1,10 @@
 "use client";
 
 import { useSync } from "./use-sync";
-import { CursorOverlay } from "./cursor-overlay";
-import { useRef, useState, useCallback, useEffect } from "react";
+import { Editor, type EditorHandle } from "./editor";
+import { byteToCharOffset } from "./diff";
+import { useRef, useState, useCallback } from "react";
+import type { CursorInfo } from "./protocol";
 
 function copyToClipboard(text: string) {
   if (navigator.clipboard?.writeText) {
@@ -30,59 +32,76 @@ function getWsUrl(): string {
   return `${protocol}//${window.location.host}/ws`;
 }
 
+function cursorsToCharOffsets(
+  cursors: CursorInfo[],
+  docText: string
+): { clientId: string; position: number; color: string }[] {
+  return cursors.map((c) => ({
+    clientId: c.client_id,
+    position: byteToCharOffset(docText, c.position),
+    color: c.color,
+  }));
+}
+
 interface EditorViewProps {
   sessionToken?: string;
   onSessionClosed?: () => void;
 }
 
 export function EditorView({ sessionToken, onSessionClosed }: EditorViewProps) {
+  const editorRef = useRef<EditorHandle>(null);
+  const [linkCopied, setLinkCopied] = useState(false);
+  const [charCount, setCharCount] = useState(0);
+
+  const handleRemoteEdits = useCallback(
+    (edits: import("./diff").EditList) => {
+      editorRef.current?.applyRemoteEdits(edits);
+    },
+    []
+  );
+
   const {
-    document,
+    document: syncDoc,
     setDocument,
     isConnected,
     serverVersion,
     clientId,
     remoteCursors,
     setCursorPosition,
-  } = useSync({ serverUrl: getWsUrl(), sessionToken });
+  } = useSync({
+    serverUrl: getWsUrl(),
+    sessionToken,
+    onRemoteEdits: handleRemoteEdits,
+  });
 
-  const [linkCopied, setLinkCopied] = useState(false);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const overlayRef = useRef<HTMLDivElement>(null);
-  const cursorRef = useRef<{ start: number; end: number } | null>(null);
+  // Only update cursor decorations when positions actually change by value.
+  // Between updates, CodeMirror's DecorationSet.map(tr.changes) keeps
+  // decorations in sync with local typing.
+  const lastCursorsKeyRef = useRef("");
+  const cursorsKey = remoteCursors
+    .map((c) => `${c.client_id}:${c.position}`)
+    .join(",");
+  if (cursorsKey !== lastCursorsKeyRef.current) {
+    lastCursorsKeyRef.current = cursorsKey;
+    editorRef.current?.updateRemoteCursors(
+      cursorsToCharOffsets(remoteCursors, syncDoc)
+    );
+  }
 
-  useEffect(() => {
-    if (textareaRef.current && cursorRef.current) {
-      textareaRef.current.selectionStart = cursorRef.current.start;
-      textareaRef.current.selectionEnd = cursorRef.current.end;
-      cursorRef.current = null;
-    }
-  }, [document]);
-
-  const handleChange = useCallback(
-    (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-      cursorRef.current = {
-        start: e.target.selectionStart,
-        end: e.target.selectionEnd,
-      };
-      setCursorPosition(e.target.selectionStart);
-      setDocument(e.target.value);
+  const handleLocalChange = useCallback(
+    (content: string) => {
+      setDocument(content);
+      setCharCount(content.length);
     },
-    [setDocument, setCursorPosition]
+    [setDocument]
   );
 
-  const handleSelect = useCallback(() => {
-    if (textareaRef.current) {
-      setCursorPosition(textareaRef.current.selectionStart);
-    }
-  }, [setCursorPosition]);
-
-  const handleScroll = useCallback(() => {
-    if (textareaRef.current && overlayRef.current) {
-      overlayRef.current.scrollTop = textareaRef.current.scrollTop;
-      overlayRef.current.scrollLeft = textareaRef.current.scrollLeft;
-    }
-  }, []);
+  const handleCursorChange = useCallback(
+    (position: number) => {
+      setCursorPosition(position);
+    },
+    [setCursorPosition]
+  );
 
   const handleShare = useCallback(() => {
     if (sessionToken && typeof window !== "undefined") {
@@ -177,29 +196,23 @@ export function EditorView({ sessionToken, onSessionClosed }: EditorViewProps) {
         )}
       </div>
 
-      <div className="relative">
-        <textarea
-          ref={textareaRef}
-          className="w-full h-96 p-4 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 font-mono text-sm leading-relaxed resize-y focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-          value={document}
-          onChange={handleChange}
-          onSelect={handleSelect}
-          onScroll={handleScroll}
-          placeholder={
-            isConnected
-              ? "Start typing to collaborate..."
-              : "Connecting to server..."
-          }
-          disabled={!isConnected}
-          spellCheck={false}
+      {isConnected ? (
+        <Editor
+          ref={editorRef}
+          initialContent={syncDoc}
+          onLocalChange={handleLocalChange}
+          onCursorChange={handleCursorChange}
+          disabled={false}
+          placeholder="Start typing to collaborate..."
         />
-        <div ref={overlayRef}>
-          <CursorOverlay text={document} cursors={remoteCursors} />
+      ) : (
+        <div className="w-full h-96 p-4 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-zinc-400 dark:text-zinc-600 font-mono text-sm">
+          Connecting to server...
         </div>
-      </div>
+      )}
 
       <div className="mt-2 text-xs text-zinc-400 dark:text-zinc-600">
-        {document.length} characters
+        {charCount} characters
       </div>
     </>
   );
