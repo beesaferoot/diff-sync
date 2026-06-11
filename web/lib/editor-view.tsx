@@ -2,7 +2,6 @@
 
 import { useSync } from "./use-sync";
 import { Editor, type EditorHandle } from "./editor";
-import { byteToCharOffset } from "./diff";
 import { useRef, useState, useCallback } from "react";
 import type { CursorInfo } from "./protocol";
 
@@ -34,11 +33,11 @@ function getWsUrl(): string {
 
 function cursorsToCharOffsets(
   cursors: CursorInfo[],
-  docText: string
+  mapPosition: (serverByteOffset: number) => number
 ): { clientId: string; position: number; color: string }[] {
   return cursors.map((c) => ({
     clientId: c.client_id,
-    position: byteToCharOffset(docText, c.position),
+    position: mapPosition(c.position),
     color: c.color,
   }));
 }
@@ -72,6 +71,7 @@ export function EditorView({ sessionToken, onSessionClosed }: EditorViewProps) {
     clientId,
     remoteCursors,
     setCursorPosition,
+    mapRemoteCursor,
   } = useSync({
     serverUrl: getWsUrl(),
     sessionToken,
@@ -88,7 +88,7 @@ export function EditorView({ sessionToken, onSessionClosed }: EditorViewProps) {
   if (cursorsKey !== lastCursorsKeyRef.current) {
     lastCursorsKeyRef.current = cursorsKey;
     editorRef.current?.updateRemoteCursors(
-      cursorsToCharOffsets(remoteCursors, syncDoc)
+      cursorsToCharOffsets(remoteCursors, mapRemoteCursor)
     );
   }
 

@@ -17,6 +17,12 @@ export function byteToCharOffset(text: string, byteOffset: number): number {
   return prefix.length;
 }
 
+/** Convert a JS string character index to a UTF-8 byte offset. */
+export function charToByteOffset(text: string, charOffset: number): number {
+  const clamped = Math.max(0, Math.min(charOffset, text.length));
+  return encoder.encode(text.slice(0, clamped)).length;
+}
+
 export type Edit =
   | { Insert: { pos: number; text: string } }
   | { Delete: { pos: number; len: number } }
@@ -164,4 +170,42 @@ export function patch(text: string, editList: EditList): string {
   }
 
   return decoder.decode(bytes);
+}
+
+/**
+ * Map a byte offset through an edit list, returning where that offset lands in
+ * the patched text. Edit positions are byte offsets in the *original* text, so
+ * we compare every edit against the original `offset` and accumulate the net
+ * length delta of edits that fall before it. Used to re-anchor a remote cursor
+ * (expressed in server-document coordinates) into the local document, which may
+ * carry un-synced local edits.
+ */
+export function mapByteOffsetThroughEdits(
+  offset: number,
+  editList: EditList
+): number {
+  let delta = 0;
+  for (const edit of editList.edits) {
+    if ("Insert" in edit) {
+      if (edit.Insert.pos <= offset) {
+        delta += encoder.encode(edit.Insert.text).length;
+      }
+    } else if ("Delete" in edit) {
+      const { pos, len } = edit.Delete;
+      if (pos + len <= offset) {
+        delta -= len; // deletion entirely before the cursor
+      } else if (pos < offset) {
+        delta -= offset - pos; // cursor sits inside the deleted range
+      }
+    } else {
+      const { pos, old_len, new_text } = edit.Replace;
+      const newLen = encoder.encode(new_text).length;
+      if (pos + old_len <= offset) {
+        delta += newLen - old_len; // replacement entirely before the cursor
+      } else if (pos < offset) {
+        delta += newLen - (offset - pos); // cursor inside the replaced range
+      }
+    }
+  }
+  return Math.max(0, offset + delta);
 }

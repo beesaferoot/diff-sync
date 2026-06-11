@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { SyncEngine } from "./sync-engine";
 import type { SyncMessage, CursorInfo } from "./protocol";
-import type { EditList } from "./diff";
+import { byteToCharOffset, charToByteOffset, type EditList } from "./diff";
 
 const SYNC_INTERVAL_MS = 200;
 const RECONNECT_BASE_MS = 1000;
@@ -24,6 +24,11 @@ interface UseSyncResult {
   clientId: string;
   remoteCursors: CursorInfo[];
   setCursorPosition: (position: number) => void;
+  /**
+   * Convert a remote cursor's server-document byte offset into a local
+   * character offset, re-anchored through any un-synced local edits.
+   */
+  mapRemoteCursor: (serverByteOffset: number) => number;
 }
 
 function generateClientId(): string {
@@ -65,6 +70,15 @@ export function useSync({
     cursorPositionRef.current = position;
   }, []);
 
+  const mapRemoteCursor = useCallback((serverByteOffset: number): number => {
+    const engine = engineRef.current;
+    if (!engine) return serverByteOffset;
+    // Re-anchor the server-space offset through our pending local edits, then
+    // express it as a character offset for CodeMirror.
+    const localByte = engine.mapToLocalOffset(serverByteOffset);
+    return byteToCharOffset(engine.text(), localByte);
+  }, []);
+
   const stopSyncInterval = useCallback(() => {
     if (syncIntervalRef.current) {
       clearInterval(syncIntervalRef.current);
@@ -79,12 +93,19 @@ export function useSync({
         if (ws.readyState !== WebSocket.OPEN) return;
 
         const edits = engine.diffAndUpdateShadow();
+        // The cursor arrives from CodeMirror as a character offset; the wire
+        // protocol and every other client expect a UTF-8 byte offset.
+        const cursorChar = cursorPositionRef.current;
+        const cursorByte =
+          cursorChar === null
+            ? null
+            : charToByteOffset(engine.text(), cursorChar);
         const msg: SyncMessage = {
           ClientSync: {
             client_id: clientId,
             edits,
             client_version: engine.getVersion(),
-            cursor_position: cursorPositionRef.current,
+            cursor_position: cursorByte,
           },
         };
         ws.send(JSON.stringify(msg));
@@ -183,5 +204,6 @@ export function useSync({
     clientId,
     remoteCursors,
     setCursorPosition,
+    mapRemoteCursor,
   };
 }

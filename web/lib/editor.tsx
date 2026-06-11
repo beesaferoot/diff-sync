@@ -108,6 +108,7 @@ export const Editor = forwardRef(function Editor(
       doc: initialContent,
       extensions: [
         markdown(),
+        EditorView.lineWrapping,
         ...(isDark ? [oneDark] : []),
         ...(placeholder
           ? [
