@@ -52,6 +52,10 @@ export function EditorView({ sessionToken, onSessionClosed }: EditorViewProps) {
   const editorRef = useRef<EditorHandle>(null);
   const [linkCopied, setLinkCopied] = useState(false);
   const [charCount, setCharCount] = useState(0);
+  const [closePrompt, setClosePrompt] = useState(false);
+  const [secretInput, setSecretInput] = useState("");
+  const [closeError, setCloseError] = useState<string | null>(null);
+  const [closing, setClosing] = useState(false);
 
   const handleRemoteEdits = useCallback(
     (edits: import("./diff").EditList) => {
@@ -112,27 +116,63 @@ export function EditorView({ sessionToken, onSessionClosed }: EditorViewProps) {
     }
   }, [sessionToken]);
 
-  const handleCloseSession = useCallback(async () => {
+  const closeWithSecret = useCallback(
+    async (secret: string) => {
+      if (!sessionToken || typeof window === "undefined") return;
+      setClosing(true);
+      setCloseError(null);
+      try {
+        const res = await fetch(`/api/sessions/${sessionToken}/close`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ creator_secret: secret }),
+        });
+
+        if (res.ok) {
+          sessionStorage.removeItem(`creator_secret_${sessionToken}`);
+          onSessionClosed?.();
+          return;
+        }
+
+        if (res.status === 403) {
+          setCloseError("Invalid creator secret.");
+        } else if (res.status === 410) {
+          setCloseError("This session is already closed.");
+        } else if (res.status === 404) {
+          setCloseError("Session not found.");
+        } else {
+          setCloseError("Failed to close session. Try again.");
+        }
+      } catch {
+        setCloseError("Couldn't reach the server. Try again.");
+      } finally {
+        setClosing(false);
+      }
+    },
+    [sessionToken, onSessionClosed]
+  );
+
+  const handleCloseClick = useCallback(() => {
     if (!sessionToken || typeof window === "undefined") return;
-    const secret = sessionStorage.getItem(`creator_secret_${sessionToken}`);
-    if (!secret) return;
-
-    const res = await fetch(`/api/sessions/${sessionToken}/close`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ creator_secret: secret }),
-    });
-
-    if (res.ok) {
-      sessionStorage.removeItem(`creator_secret_${sessionToken}`);
-      onSessionClosed?.();
+    const stored = sessionStorage.getItem(`creator_secret_${sessionToken}`);
+    if (stored) {
+      closeWithSecret(stored);
+    } else {
+      // Tab was reopened (or it's a different device) — the secret isn't in
+      // sessionStorage, so ask the creator to paste the secret they saved.
+      setCloseError(null);
+      setClosePrompt(true);
     }
-  }, [sessionToken, onSessionClosed]);
+  }, [sessionToken, closeWithSecret]);
 
-  const isCreator =
-    sessionToken &&
-    typeof window !== "undefined" &&
-    sessionStorage.getItem(`creator_secret_${sessionToken}`);
+  const handleSecretSubmit = useCallback(
+    (e: React.FormEvent) => {
+      e.preventDefault();
+      const trimmed = secretInput.trim();
+      if (trimmed) closeWithSecret(trimmed);
+    },
+    [secretInput, closeWithSecret]
+  );
 
   const statusSeparator = (
     <span className="text-zinc-300 dark:text-zinc-700">|</span>
@@ -181,20 +221,56 @@ export function EditorView({ sessionToken, onSessionClosed }: EditorViewProps) {
             >
               {linkCopied ? "Copied!" : "Copy link"}
             </button>
-            {isCreator && (
-              <>
-                {statusSeparator}
-                <button
-                  onClick={handleCloseSession}
-                  className="text-red-500 hover:text-red-400 cursor-pointer"
-                >
-                  Close session
-                </button>
-              </>
-            )}
+            {statusSeparator}
+            <button
+              onClick={handleCloseClick}
+              disabled={closing}
+              className="text-red-500 hover:text-red-400 cursor-pointer disabled:opacity-50 disabled:cursor-default"
+            >
+              {closing ? "Closing…" : "Close session"}
+            </button>
           </>
         )}
       </div>
+
+      {closePrompt && (
+        <form
+          onSubmit={handleSecretSubmit}
+          className="flex items-center gap-2 mb-4 text-sm flex-wrap"
+        >
+          <input
+            type="text"
+            autoFocus
+            value={secretInput}
+            onChange={(e) => setSecretInput(e.target.value)}
+            placeholder="Paste your creator secret"
+            className="font-mono text-xs px-2 py-1 rounded border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-800 dark:text-zinc-200 min-w-[20rem]"
+          />
+          <button
+            type="submit"
+            disabled={closing || !secretInput.trim()}
+            className="text-red-500 hover:text-red-400 cursor-pointer disabled:opacity-50 disabled:cursor-default"
+          >
+            {closing ? "Closing…" : "Confirm close"}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setClosePrompt(false);
+              setSecretInput("");
+              setCloseError(null);
+            }}
+            className="text-zinc-500 hover:text-zinc-400 cursor-pointer"
+          >
+            Cancel
+          </button>
+          {closeError && <span className="text-red-500">{closeError}</span>}
+        </form>
+      )}
+
+      {closeError && !closePrompt && (
+        <div className="mb-4 text-sm text-red-500">{closeError}</div>
+      )}
 
       {isConnected ? (
         <Editor
