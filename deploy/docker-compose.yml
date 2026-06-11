@@ -1,0 +1,27 @@
+name: diff-sync
+
+services:
+  app:
+    # On the VPS, IMAGE points at the prebuilt GHCR tag so `pull` works and the box
+    # never compiles. Locally, `up --build` builds and tags this same name.
+    image: ${IMAGE:-diff-sync:local}
+    build:
+      context: ..                 # repo root, so Cargo.toml / src / web are visible
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    volumes:
+      - data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    ports:
+      # WS/HTTP — loopback only by default; host nginx reverse-proxies to it.
+      - "${HTTP_BIND:-127.0.0.1}:8081:8081"
+      # TCP — public, CLI clients connect directly.
+      - "8080:8080"
+
+volumes:
+  data:

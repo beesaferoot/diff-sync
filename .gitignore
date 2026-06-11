@@ -11,3 +11,6 @@ test/test-results/
 test/playwright-report/
 test_documents.db
 .claude
+
+# Deployment secrets
+deploy/.env

@@ -1,0 +1,12 @@
+target/
+web/node_modules/
+web/.next/
+web/out/
+test/
+.git/
+.claude/
+docs/
+deploy/
+*.db
+*.md
+.gitignore
