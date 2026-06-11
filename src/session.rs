@@ -2,7 +2,7 @@ use crate::{DocumentDB, SharedSyncServer, SyncServer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 
 pub struct SessionManager {
     db_path: String,
@@ -13,6 +13,7 @@ pub struct SessionManager {
 struct SessionEntry {
     server: SharedSyncServer,
     last_active: Instant,
+    shutdown: broadcast::Sender<()>,
 }
 
 pub type SharedSessionManager = Arc<Mutex<SessionManager>>;
@@ -50,10 +51,14 @@ impl SessionManager {
         Ok((token, creator_secret))
     }
 
-    pub fn get_or_start_session(&mut self, token: &str) -> Result<SharedSyncServer, SessionError> {
+    /// Returns the session's server and a receiver that fires when it's closed.
+    pub fn get_or_start_session(
+        &mut self,
+        token: &str,
+    ) -> Result<(SharedSyncServer, broadcast::Receiver<()>), SessionError> {
         if let Some(entry) = self.sessions.get_mut(token) {
             entry.last_active = Instant::now();
-            return Ok(Arc::clone(&entry.server));
+            return Ok((Arc::clone(&entry.server), entry.shutdown.subscribe()));
         }
 
         let db = DocumentDB::new(&self.db_path)
@@ -73,15 +78,18 @@ impl SessionManager {
                 .map_err(|e| SessionError::Internal(e))?,
         ));
 
+        let (shutdown, rx) = broadcast::channel(1);
+
         self.sessions.insert(
             token.to_string(),
             SessionEntry {
                 server: Arc::clone(&server),
                 last_active: Instant::now(),
+                shutdown,
             },
         );
 
-        Ok(server)
+        Ok((server, rx))
     }
 
     pub async fn close_session(
@@ -109,16 +117,10 @@ impl SessionManager {
             return Err(SessionError::Forbidden);
         }
 
+        // Wake connected clients so they can notify the user and close. `send`
+        // errors only when nobody is listening, which is fine.
         if let Some(entry) = self.sessions.remove(token) {
-            let mut server = entry.server.lock().await;
-            let client_ids: Vec<String> = server
-                .get_connected_clients()
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            for id in client_ids {
-                server.disconnect_client(&id);
-            }
+            let _ = entry.shutdown.send(());
         }
 
         Ok(())

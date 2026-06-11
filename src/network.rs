@@ -48,6 +48,8 @@ pub enum SyncMessage {
     Disconnect {
         client_id: String,
     },
+    /// Sent to every connected client when the session is closed by its creator.
+    SessionClosed,
     Ping,
     Pong,
 }

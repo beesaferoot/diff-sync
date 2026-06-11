@@ -29,6 +29,7 @@ interface UseSyncResult {
    * character offset, re-anchored through any un-synced local edits.
    */
   mapRemoteCursor: (serverByteOffset: number) => number;
+  sessionClosed: boolean;
 }
 
 function generateClientId(): string {
@@ -46,6 +47,7 @@ export function useSync({
   const [isConnected, setIsConnected] = useState(false);
   const [serverVersion, setServerVersion] = useState(0);
   const [remoteCursors, setRemoteCursors] = useState<CursorInfo[]>([]);
+  const [sessionClosed, setSessionClosed] = useState(false);
 
   const engineRef = useRef<SyncEngine | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -55,6 +57,7 @@ export function useSync({
   );
   const reconnectDelayRef = useRef(RECONNECT_BASE_MS);
   const mountedRef = useRef(true);
+  const sessionClosedRef = useRef(false);
   const cursorPositionRef = useRef<number | null>(null);
   const onRemoteEditsRef = useRef(onRemoteEdits);
   onRemoteEditsRef.current = onRemoteEdits;
@@ -136,6 +139,16 @@ export function useSync({
         return;
       }
 
+      if (msg === "SessionClosed") {
+        sessionClosedRef.current = true;
+        setSessionClosed(true);
+        setIsConnected(false);
+        setRemoteCursors([]);
+        stopSyncInterval();
+        wsRef.current?.close();
+        return;
+      }
+
       if (typeof msg === "object" && msg !== null) {
         if ("ConnectOk" in msg) {
           const { document: doc, server_version } = msg.ConnectOk;
@@ -167,7 +180,7 @@ export function useSync({
       setRemoteCursors([]);
       stopSyncInterval();
 
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || sessionClosedRef.current) return;
 
       const delay = reconnectDelayRef.current;
       reconnectDelayRef.current = Math.min(delay * 2, RECONNECT_MAX_MS);
@@ -205,5 +218,6 @@ export function useSync({
     remoteCursors,
     setCursorPosition,
     mapRemoteCursor,
+    sessionClosed,
   };
 }

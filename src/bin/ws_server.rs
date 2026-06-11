@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tokio::time::{interval, Duration};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -242,16 +242,34 @@ async fn ws_handler(
         .into_response()
 }
 
+/// Resolves when the session closes. Never resolves for the default server
+/// (no signal), so `select!` falls through to the socket.
+async fn await_session_closed(shutdown: &mut Option<broadcast::Receiver<()>>) {
+    match shutdown {
+        Some(rx) => {
+            let _ = rx.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 async fn handle_ws_client(
     mut socket: WebSocket,
     manager: SharedSessionManager,
     session_token: Option<String>,
 ) {
-    let server = {
+    let (server, mut shutdown) = {
         let mut mgr = manager.lock().await;
         if let Some(ref token) = session_token {
             match mgr.get_or_start_session(token) {
-                Ok(s) => s,
+                Ok((s, rx)) => (s, Some(rx)),
+                Err(SessionError::Closed) => {
+                    let closed = SyncMessage::SessionClosed;
+                    if let Ok(json) = serde_json::to_string(&closed) {
+                        let _ = socket.send(Message::Text(json.into())).await;
+                    }
+                    return;
+                }
                 Err(e) => {
                     eprintln!("Failed to start session: {e}");
                     let err = SyncMessage::Error {
@@ -265,7 +283,7 @@ async fn handle_ws_client(
             }
         } else {
             match mgr.default_server() {
-                Ok(s) => s,
+                Ok(s) => (s, None),
                 Err(e) => {
                     eprintln!("Failed to start default server: {e}");
                     return;
@@ -282,38 +300,55 @@ async fn handle_ws_client(
 
     let mut client_id: Option<String> = None;
 
-    while let Some(Ok(msg)) = socket.recv().await {
-        match msg {
-            Message::Text(text) => {
-                let parsed: Result<SyncMessage, _> = serde_json::from_str(&text);
-                match parsed {
-                    Ok(message) => {
-                        let response =
-                            handle_sync_message(message, &server, &mut client_id).await;
-                        if let Some(resp) = response {
-                            match serde_json::to_string(&resp) {
-                                Ok(json) => {
-                                    if socket.send(Message::Text(json.into())).await.is_err() {
-                                        break;
+    loop {
+        tokio::select! {
+            _ = await_session_closed(&mut shutdown) => {
+                println!("Session closed, disconnecting client ({})", label.yellow());
+                let closed = SyncMessage::SessionClosed;
+                if let Ok(json) = serde_json::to_string(&closed) {
+                    let _ = socket.send(Message::Text(json.into())).await;
+                }
+                let _ = socket.send(Message::Close(None)).await;
+                break;
+            }
+            incoming = socket.recv() => {
+                let msg = match incoming {
+                    Some(Ok(msg)) => msg,
+                    _ => break,
+                };
+                match msg {
+                    Message::Text(text) => {
+                        let parsed: Result<SyncMessage, _> = serde_json::from_str(&text);
+                        match parsed {
+                            Ok(message) => {
+                                let response =
+                                    handle_sync_message(message, &server, &mut client_id).await;
+                                if let Some(resp) = response {
+                                    match serde_json::to_string(&resp) {
+                                        Ok(json) => {
+                                            if socket.send(Message::Text(json.into())).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Err(e) => eprintln!("Failed to serialize WS response: {e}"),
                                     }
                                 }
-                                Err(e) => eprintln!("Failed to serialize WS response: {e}"),
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to parse WS message: {e}");
+                                let err = SyncMessage::Error {
+                                    message: format!("Invalid message format: {e}"),
+                                };
+                                if let Ok(json) = serde_json::to_string(&err) {
+                                    let _ = socket.send(Message::Text(json.into())).await;
+                                }
                             }
                         }
                     }
-                    Err(e) => {
-                        eprintln!("Failed to parse WS message: {e}");
-                        let err = SyncMessage::Error {
-                            message: format!("Invalid message format: {e}"),
-                        };
-                        if let Ok(json) = serde_json::to_string(&err) {
-                            let _ = socket.send(Message::Text(json.into())).await;
-                        }
-                    }
+                    Message::Close(_) => break,
+                    _ => {}
                 }
             }
-            Message::Close(_) => break,
-            _ => {}
         }
     }
 

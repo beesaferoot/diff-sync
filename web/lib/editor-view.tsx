@@ -2,7 +2,7 @@
 
 import { useSync } from "./use-sync";
 import { Editor, type EditorHandle } from "./editor";
-import { useRef, useState, useCallback } from "react";
+import { useRef, useState, useCallback, useEffect } from "react";
 import type { CursorInfo } from "./protocol";
 
 function copyToClipboard(text: string) {
@@ -72,11 +72,16 @@ export function EditorView({ sessionToken, onSessionClosed }: EditorViewProps) {
     remoteCursors,
     setCursorPosition,
     mapRemoteCursor,
+    sessionClosed,
   } = useSync({
     serverUrl: getWsUrl(),
     sessionToken,
     onRemoteEdits: handleRemoteEdits,
   });
+
+  useEffect(() => {
+    if (sessionClosed) onSessionClosed?.();
+  }, [sessionClosed, onSessionClosed]);
 
   // Only update cursor decorations when positions actually change by value.
   // Between updates, CodeMirror's DecorationSet.map(tr.changes) keeps

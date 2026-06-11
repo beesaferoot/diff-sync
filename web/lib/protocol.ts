@@ -39,5 +39,6 @@ export type SyncMessage =
   | { ConnectOk: { server_version: number; document: Document } }
   | { Error: { message: string } }
   | { Disconnect: { client_id: string } }
+  | "SessionClosed"
   | "Ping"
   | "Pong";
